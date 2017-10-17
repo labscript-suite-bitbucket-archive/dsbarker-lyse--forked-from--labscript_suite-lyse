@@ -29,7 +29,7 @@ import types
 
 from zprocess import zmq_get
 
-__version__ = '2.1.0'
+__version__ = '2.2.0'
 
 try:
     from labscript_utils import check_version
@@ -167,7 +167,7 @@ class Run(object):
             if name in h5_file[group].attrs.keys() and not overwrite:
                 raise Exception('Attribute %s exists in group %s. ' \
                                 'Use overwrite=True to overwrite.' % (name, group))                   
-            h5_file[group].attrs.modify(name, value)
+            h5_file[group].attrs[name] = value
             
         if spinning_top:
             if self.h5_path not in _updated_data:
