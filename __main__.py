@@ -1,8 +1,21 @@
 from __future__ import division, unicode_literals, print_function, absolute_import  # Ease the transition to Python 3
 
-# stdlib imports
-
 import os
+import labscript_utils.excepthook
+
+try:
+    from labscript_utils import check_version
+except ImportError:
+    raise ImportError('Require labscript_utils > 2.1.0')
+
+check_version('labscript_utils', '2.10.0', '3')
+# Splash screen
+from labscript_utils.splash import Splash
+splash = Splash(os.path.join(os.path.dirname(__file__), 'lyse.svg'))
+splash.show()
+
+splash.update_text('importing standard library modules')
+# stdlib imports
 import sys
 import socket
 import logging
@@ -14,30 +27,26 @@ import traceback
 import pprint
 import ast
 
-# Turn on our error catching for all subsequent imports
-import labscript_utils.excepthook
-
-
 # 3rd party imports:
-
+splash.update_text('importing numpy')
 import numpy as np
+splash.update_text('importing h5_lock and h5py')
 import labscript_utils.h5_lock
 import h5py
+splash.update_text('importing pandas')
 import pandas
 
-try:
-    from labscript_utils import check_version
-except ImportError:
-    raise ImportError('Require labscript_utils > 2.1.0')
-
+splash.update_text('importing Qt')
 check_version('qtutils', '2.1.0', '3.0.0')
 
-import zprocess.locking
-from zprocess import ZMQServer
+splash.update_text('importing labscript suite modules')
+check_version('labscript_utils', '2.11.0', '3')
 
+from labscript_utils.ls_zprocess import ZMQServer, ProcessTree
 from labscript_utils.labconfig import LabConfig, config_prefix
 from labscript_utils.setup_logging import setup_logging
 from labscript_utils.qtwidgets.headerview_with_widgets import HorizontalHeaderViewWithWidgets
+from labscript_utils.qtwidgets.outputbox import OutputBox
 import labscript_utils.shared_drive as shared_drive
 
 from lyse.dataframe_utilities import (concat_with_padding,
@@ -47,7 +56,6 @@ from lyse.dataframe_utilities import (concat_with_padding,
 from qtutils.qt import QtCore, QtGui, QtWidgets
 from qtutils.qt.QtCore import pyqtSignal as Signal
 from qtutils import inmain_decorator, inmain, UiLoader, DisconnectContextManager
-from qtutils.outputbox import OutputBox
 from qtutils.auto_scroll_to_end import set_auto_scroll_to_end
 import qtutils.icons
 
@@ -57,22 +65,21 @@ if PY2:
     import Queue as queue
 else:
     import queue
+from lyse import LYSE_DIR
 
-# Set working directory to lyse folder, resolving symlinks
-lyse_dir = os.path.dirname(os.path.realpath(__file__))
-os.chdir(lyse_dir)
+process_tree = ProcessTree.instance()
 
-# Set a meaningful name for zprocess.locking's client id:
-zprocess.locking.set_client_process_name('lyse')
+# Set a meaningful name for zlock client id:
+process_tree.zlock_client.set_process_name('lyse')
 
 
 def set_win_appusermodel(window_id):
     from labscript_utils.winshell import set_appusermodel, appids, app_descriptions
-    icon_path = os.path.abspath('lyse.ico')
+    icon_path = os.path.join(LYSE_DIR, 'lyse.ico')
     executable = sys.executable.lower()
     if not executable.endswith('w.exe'):
         executable = executable.replace('.exe', 'w.exe')
-    relaunch_command = executable + ' ' + os.path.abspath(__file__.replace('.pyc', '.py'))
+    relaunch_command = executable + ' ' + os.path.join(LYSE_DIR, '__main__.py')
     relaunch_display_name = app_descriptions['lyse']
     set_appusermodel(window_id, appids['lyse'], icon_path, relaunch_command, relaunch_display_name)
 
@@ -263,7 +270,12 @@ class AnalysisRoutine(object):
         
     def start_worker(self):
         # Start a worker process for this analysis routine:
-        child_handles = zprocess.subprocess_with_queues('analysis_subprocess.py', self.output_box_port)
+        worker_path = os.path.join(LYSE_DIR, 'analysis_subprocess.py')
+
+        child_handles = process_tree.subprocess(
+            worker_path, output_redirection_port=self.output_box_port
+        )
+        
         to_worker, from_worker, worker = child_handles
         # Tell the worker what script it with be executing:
         to_worker.put(self.filepath)
@@ -445,7 +457,7 @@ class RoutineBox(object):
         
         loader = UiLoader()
         loader.registerCustomWidget(TreeView)
-        self.ui = loader.load('routinebox.ui')
+        self.ui = loader.load(os.path.join(LYSE_DIR, 'routinebox.ui'))
         container.addWidget(self.ui)
 
         if multishot:
@@ -792,14 +804,6 @@ class RoutineBox(object):
                 self.select_all_checkbox.setCheckState(QtCore.Qt.Unchecked)
             else:
                 self.select_all_checkbox.setCheckState(QtCore.Qt.PartiallyChecked)
-                
-   # TESTING ONLY REMOVE IN PRODUCTION
-    def queue_dummy_routines(self):
-        folder = os.path.abspath('test_routines')
-        for filepath in ['hello.py', 'test.py']:
-            routine = AnalysisRoutine(os.path.join(folder, filepath), self.model, self.output_box_port)
-            self.routines.append(routine)
-        self.update_select_all_checkstate()
 
 
 class EditColumnsDialog(QtWidgets.QDialog):
@@ -833,7 +837,7 @@ class EditColumns(object):
         self.old_columns_visible = columns_visible.copy()
 
         loader = UiLoader()
-        self.ui = loader.load('edit_columns.ui', EditColumnsDialog())
+        self.ui = loader.load(os.path.join(LYSE_DIR, 'edit_columns.ui'), EditColumnsDialog())
 
         self.model = UneditableModel()
         self.header = HorizontalHeaderViewWithWidgets(self.model)
@@ -1353,25 +1357,25 @@ class DataFrameModel(QtCore.QObject):
             return
 
         filepath_colname = ('filepath',) + ('',) * (self.nlevels - 1)
-        assert filepath == self.dataframe.get_value(row_number, filepath_colname)
+        assert filepath == self.dataframe.at[row_number, filepath_colname]
 
         if updated_row_data is not None and not dataframe_already_updated:
             for group, name in updated_row_data:
                 column_name = (group, name) + ('',) * (self.nlevels - 2)
                 value = updated_row_data[group, name]
                 try:
-                    self.dataframe.set_value(row_number, column_name, value)
+                    self.dataframe.at[row_number, column_name] = value
                 except ValueError:
                     # did the column not already exist when we tried to set an iterable?
                     if not column_name in self.dataframe.columns:
                         # create it with a non-iterable and then overwrite with the iterable value:
-                        self.dataframe.set_value(row_number, column_name, None)
+                        self.dataframe.at[row_number, column_name] = None
                     else:
                         # Incompatible datatype - convert the datatype of the column to
                         # 'object'
                         self.dataframe[column_name] = self.dataframe[column_name].astype('object')
                     # Now that the column exists and has dtype object, we can set the value:
-                    self.dataframe.set_value(row_number, column_name, value)
+                    self.dataframe.at[row_number, column_name] = value
 
             dataframe_already_updated = True
 
@@ -1475,9 +1479,13 @@ class DataFrameModel(QtCore.QObject):
         self._model.blockSignals(False)
         self._model.layoutChanged.emit()
 
-    def new_row(self, filepath):
+    def new_row(self, filepath, done=False):
         status_item = QtGui.QStandardItem()
-        status_item.setData(0, self.ROLE_STATUS_PERCENT)
+        if done:
+            status_item.setData(100, self.ROLE_STATUS_PERCENT)
+            status_item.setIcon(QtGui.QIcon(':/qtutils/fugue/tick'))
+        else:
+            status_item.setData(0, self.ROLE_STATUS_PERCENT)
         status_item.setIcon(QtGui.QIcon(':qtutils/fugue/tick'))
         name_item = QtGui.QStandardItem(filepath)
         return [status_item, name_item]
@@ -1521,7 +1529,7 @@ class DataFrameModel(QtCore.QObject):
             vertical_header_item.setText(vert_header_text)
     
     @inmain_decorator()
-    def add_files(self, filepaths, new_row_data):
+    def add_files(self, filepaths, new_row_data, done=False):
         """Add files to the dataframe model. New_row_data should be a
         dataframe containing the new rows."""
 
@@ -1549,7 +1557,7 @@ class DataFrameModel(QtCore.QObject):
 
         for filepath in to_add:
             # Add the new rows to the Qt model:
-            self._model.appendRow(self.new_row(filepath))
+            self._model.appendRow(self.new_row(filepath, done=done))
             vert_header_item = QtGui.QStandardItem('...loading...')
             self._model.setVerticalHeaderItem(self._model.rowCount() - 1, vert_header_item)
             self._view.resizeRowToContents(self._model.rowCount() - 1)
@@ -1587,7 +1595,7 @@ class FileBox(object):
 
         loader = UiLoader()
         loader.registerCustomWidget(TableView)
-        self.ui = loader.load('filebox.ui')
+        self.ui = loader.load(os.path.join(LYSE_DIR, 'filebox.ui'))
         self.ui.progressBar_add_shots.hide()
         container.addWidget(self.ui)
         self.shots_model = DataFrameModel(self.ui.tableView, self.exp_config)
@@ -1880,8 +1888,9 @@ class FileBox(object):
 class Lyse(object):
 
     def __init__(self):
+        splash.update_text('loading graphical interface')
         loader = UiLoader()
-        self.ui = loader.load('main.ui', LyseMainWindow())
+        self.ui = loader.load(os.path.join(LYSE_DIR, 'main.ui'), LyseMainWindow())
 
         self.connect_signals()
 
@@ -1912,6 +1921,9 @@ class Lyse(object):
         self.ui.actionRevert_configuration.triggered.connect(self.on_revert_configuration_triggered)
         self.ui.actionSave_configuration.triggered.connect(self.on_save_configuration_triggered)
         self.ui.actionSave_configuration_as.triggered.connect(self.on_save_configuration_as_triggered)
+        self.ui.actionSave_dataframe_as.triggered.connect(lambda: self.on_save_dataframe_triggered(True))
+        self.ui.actionSave_dataframe.triggered.connect(lambda: self.on_save_dataframe_triggered(False))
+        self.ui.actionLoad_dataframe.triggered.connect(self.on_load_dataframe_triggered)
 
         self.ui.resize(1600, 900)
 
@@ -1930,7 +1942,7 @@ class Lyse(object):
 
             def load_the_config_file():
                 try:
-                    self.load_configuration(autoload_config_file)
+                    self.load_configuration(autoload_config_file, restore_window_geometry)
                     self.output_box.output('done.\n')
                 except Exception as e:
                     self.output_box.output('\nCould not load config file: %s: %s\n\n' %
@@ -1939,8 +1951,16 @@ class Lyse(object):
                     self.output_box.output('Ready.\n\n')
                 finally:
                     self.ui.setEnabled(True)
-            # Defer this until 50ms after the window has shown,
-            # so that the GUI pops up faster in the meantime
+            # Load the window geometry now, but then defer the other loading until 50ms
+            # after the window has shown, so that the GUI pops up faster in the meantime.
+            try:
+                self.load_window_geometry_configuration(autoload_config_file)
+            except Exception:
+                # ignore error for now and let it be raised again in the call to load_configuration:
+                restore_window_geometry = True
+            else:
+                # Success - skip loading window geometry in load_configuration:
+                restore_window_geometry = False
             self.ui.firstPaint.connect(lambda: QtCore.QTimer.singleShot(50, load_the_config_file))
 
         self.ui.show()
@@ -2086,7 +2106,7 @@ class Lyse(object):
         file = os.path.abspath(file)
         self.load_configuration(file)
 
-    def load_configuration(self, filename):
+    def load_configuration(self, filename, restore_window_geometry=True):
         self.last_save_config_file = filename
         self.ui.actionSave_configuration.setText('Save configuration %s' % filename)
         lyse_config = LabConfig(filename)
@@ -2116,6 +2136,20 @@ class Lyse(object):
                 self.filebox.pause_analysis()
         except (LabConfig.NoOptionError, LabConfig.NoSectionError):
             pass
+        if restore_window_geometry:
+            self.load_window_geometry_configuration(filename)
+
+        # Set as self.last_save_data:
+        save_data = self.get_save_data()
+        self.last_save_data = save_data
+        self.ui.actionSave_configuration_as.setEnabled(True)
+        self.ui.actionRevert_configuration.setEnabled(True)
+
+    def load_window_geometry_configuration(self, filename):
+        """Load only the window geometry from the config file. It's useful to have this
+        separate from the rest of load_configuration so that it can be called before the
+        window is shown."""
+        lyse_config = LabConfig(filename)
         try:
             screen_geometry = ast.literal_eval(lyse_config.get('lyse_state', 'screen_geometry'))
         except (LabConfig.NoOptionError, LabConfig.NoSectionError):
@@ -2150,11 +2184,6 @@ class Lyse(object):
                 except (LabConfig.NoOptionError, LabConfig.NoSectionError):
                     pass
 
-        # Set as self.last_save_data:
-        save_data = self.get_save_data()
-        self.last_save_data = save_data
-        self.ui.actionSave_configuration_as.setEnabled(True)
-        self.ui.actionRevert_configuration.setEnabled(True)
 
     def setup_config(self):
         required_config_params = {"DEFAULT": ["experiment_name"],
@@ -2172,57 +2201,103 @@ class Lyse(object):
     def connect_signals(self):
         if os.name == 'nt':
             self.ui.newWindow.connect(set_win_appusermodel)
-    
-    def on_keyPress(self, key, modifiers, is_autorepeat):
-        # Keyboard shortcut to delete shots or routines depending on which
-        # treeview/tableview has focus. Shift-delete to skip confirmation.
-        if key == QtCore.Qt.Key_Delete and not is_autorepeat:
-            confirm = modifiers != QtCore.Qt.ShiftModifier 
-            if self.filebox.ui.tableView.hasFocus():
-                self.filebox.shots_model.remove_selection(confirm)
-            if self.singleshot_routinebox.ui.treeView.hasFocus():
-                self.singleshot_routinebox.remove_selection(confirm)
-            if self.multishot_routinebox.ui.treeView.hasFocus():
-                self.multishot_routinebox.remove_selection(confirm)
 
+        # Keyboard shortcuts:
+        QtWidgets.QShortcut('Del', self.ui, lambda: self.delete_items(True))
+        QtWidgets.QShortcut('Shift+Del', self.ui, lambda: self.delete_items(False))
 
-class KeyPressQApplication(QtWidgets.QApplication):
+    def on_save_dataframe_triggered(self, choose_folder=True):
+        df = self.filebox.shots_model.dataframe.copy()
+        if len(df) > 0:
+            default = self.exp_config.get('paths', 'experiment_shot_storage')
+            if choose_folder:
+                save_path = QtWidgets.QFileDialog.getExistingDirectory(self.ui, 'Select a Folder for the Dataframes', default)
+                if type(save_path) is tuple:
+                    save_path, _ = save_path
+                if not save_path:
+                    # User cancelled
+                    return
+            sequences = df.sequence.unique()
+            for sequence in sequences:
+                sequence_df = pandas.DataFrame(df[df['sequence'] == sequence], columns=df.columns).dropna(axis=1, how='all')
+                labscript = sequence_df['labscript'].iloc[0]
+                filename = "dataframe_{}_{}.msg".format(sequence.to_pydatetime().strftime("%Y%m%dT%H%M%S"),labscript[:-3])
+                if not choose_folder:
+                    save_path = os.path.dirname(sequence_df['filepath'].iloc[0])
+                sequence_df.infer_objects()
+                for col in sequence_df.columns :
+                    if sequence_df[col].dtype == object:
+                        sequence_df[col] = pandas.to_numeric(sequence_df[col], errors='ignore')
+                sequence_df.to_msgpack(os.path.join(save_path, filename))
+        else:
+            error_dialog('Dataframe is empty')
 
-    """A Qapplication that emits a signal keyPress(key) on keypresses"""
-    keyPress = Signal(int, QtCore.Qt.KeyboardModifiers, bool)
-    keyRelease = Signal(int, QtCore.Qt.KeyboardModifiers, bool)
+    def on_load_dataframe_triggered(self):
+        default = os.path.join(self.exp_config.get('paths', 'experiment_shot_storage'), 'dataframe.msg')
+        file = QtWidgets.QFileDialog.getOpenFileName(self.ui,
+                        'Select dataframe file to load',
+                        default,
+                        "dataframe files (*.msg)")
+        if type(file) is tuple:
+            file, _ = file
+        if not file:
+            # User cancelled
+            return
+        # Convert to standard platform specific path, otherwise Qt likes
+        # forward slashes:
+        file = os.path.abspath(file)
+        df = pandas.read_msgpack(file).sort_values("run time").reset_index()
+                
+        # Check for changes in the shot files since the dataframe was exported
+        def changed_since(filepath, time):
+            if os.path.isfile(filepath):
+                return os.path.getmtime(filepath) > time
+            else:
+                return False
 
-    def notify(self, object, event):
-        if event.type() == QtCore.QEvent.KeyPress and event.key():
-            self.keyPress.emit(event.key(), event.modifiers(), event.isAutoRepeat())
-        elif event.type() == QtCore.QEvent.KeyRelease and event.key():
-            self.keyRelease.emit(event.key(), event.modifiers(), event.isAutoRepeat())
-        return QtWidgets.QApplication.notify(self, object, event)
+        filepaths = df["filepath"].tolist()
+        changetime_cache = os.path.getmtime(file)
+        need_updating = np.where(map(lambda x: changed_since(x, changetime_cache), filepaths))[0]
+        need_updating = np.sort(need_updating)[::-1]  # sort in descending order to not remove the wrong items with pop
+
+        # Reload the files where changes where made since exporting
+        for index in need_updating:
+            filepath = filepaths.pop(index)
+            self.filebox.incoming_queue.put(filepath)
+        df = df.drop(need_updating)
+        
+        self.filebox.shots_model.add_files(filepaths, df, done=True)
+
+    def delete_items(self, confirm):
+        """Delete items from whichever box has focus, with optional confirmation
+        dialog"""
+        if self.filebox.ui.tableView.hasFocus():
+            self.filebox.shots_model.remove_selection(confirm)
+        if self.singleshot_routinebox.ui.treeView.hasFocus():
+            self.singleshot_routinebox.remove_selection(confirm)
+        if self.multishot_routinebox.ui.treeView.hasFocus():
+            self.multishot_routinebox.remove_selection(confirm)
 
 
 if __name__ == "__main__":
     logger = setup_logging('lyse')
     labscript_utils.excepthook.set_logger(logger)
     logger.info('\n\n===============starting===============\n')
-    qapplication = KeyPressQApplication(sys.argv)
+    qapplication = QtWidgets.QApplication(sys.argv)
     qapplication.setAttribute(QtCore.Qt.AA_DontShowIconsInMenus, False)
     app = Lyse()
 
     # Start the web server:
+    splash.update_text('starting analysis server')
     server = WebServer(app.port)
-
+    splash.update_text('done')
     # Let the interpreter run every 500ms so it sees Ctrl-C interrupts:
     timer = QtCore.QTimer()
     timer.start(500)
     timer.timeout.connect(lambda: None)  # Let the interpreter run each 500 ms.
     # Upon seeing a ctrl-c interrupt, quit the event loop
     signal.signal(signal.SIGINT, lambda *args: qapplication.exit())
-    # Do not run qapplication.exec_() whilst waiting for keyboard input if
-    # we hop into interactive mode.
-    QtCore.pyqtRemoveInputHook() # TODO remove once updating to pyqt 4.11 or whatever fixes that bug
     
-    # Connect keyboard shortcuts:
-    qapplication.keyPress.connect(app.on_keyPress)
-    
+    splash.hide()
     qapplication.exec_()
     server.shutdown()

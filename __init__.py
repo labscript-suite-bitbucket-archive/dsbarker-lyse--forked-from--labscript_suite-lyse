@@ -19,6 +19,7 @@ import socket
 import pickle as pickle
 import inspect
 import sys
+import threading
 
 import labscript_utils.h5_lock, h5py
 from labscript_utils.labconfig import LabConfig
@@ -26,22 +27,33 @@ import pandas
 from numpy import array, ndarray
 import types
 
-from zprocess import zmq_get
-
-__version__ = '2.2.0'
+__version__ = '2.3.1'
 
 try:
     from labscript_utils import check_version
 except ImportError:
     raise ImportError('Require labscript_utils > 2.1.0')
 
-# require pandas v0.15.0 up to the next major version
-check_version('pandas', '0.15.0', '1.0')
+check_version('pandas', '0.21.0', '1.0')
 check_version('zprocess', '2.2.0', '3.0')
-check_version('labscript_utils', '2.6', '3.0')
-from labscript_utils import PY2
+check_version('labscript_utils', '2.11.0', '3.0')
+from labscript_utils import PY2, dedent
+from labscript_utils.ls_zprocess import zmq_get
 if PY2:
     str = unicode
+
+
+from labscript_utils import labscript_suite_install_dir
+if labscript_suite_install_dir is not None:
+    LYSE_DIR = os.path.join(labscript_suite_install_dir, 'lyse')
+else:
+    # No labscript install directory found? Fall back to relying on __file__
+    LYSE_DIR = os.path.dirname(os.path.realpath(__file__))
+if not os.path.isdir(LYSE_DIR):
+    # Don't want to continue if we have not found the directory:
+    msg = "Cannot locate the directory lyse is installed in."
+    raise RuntimeError(msg)
+
 
 # If running stand-alone, and not from within lyse, the below two variables
 # will be as follows. Otherwise lyse will override them with spinning_top =
@@ -49,6 +61,16 @@ if PY2:
 spinning_top = False
 # data to be sent back to the lyse GUI if running within lyse
 _updated_data = {}
+# dictionary of plot id's to classes to use for Plot object
+_plot_classes = {}
+# A fake Plot object to subclass if we are not running in the GUI
+Plot=object
+# An empty dictionary of plots (overwritten by the analysis worker if running within lyse)
+plots = {}
+# A threading.Event to delay the 
+delay_event = threading.Event()
+# a flag to determine whether we should wait for the delay event
+_delay_flag = False
 
 # get port that lyse is using for communication
 try:
@@ -119,7 +141,6 @@ class Run(object):
                 __file__ = frame.f_back.f_locals['__file__']
                 if PY2:
                     __file__ = __file__.decode(sys.getfilesystemencoding())
-                    print(repr(__file__))
                 self.group = os.path.basename(__file__).split('.py')[0]
                 with h5py.File(h5_path) as h5_file:
                     if not self.group in h5_file['results']:
@@ -146,6 +167,13 @@ class Run(object):
                 return list(h5_file['data']['traces'].keys())
             except KeyError:
                 return []
+                
+    def get_attrs(self, group):
+        """Returns all attributes of the specified group as a dictionary."""
+        with h5py.File(self.h5_path) as h5_file:
+            if not group in h5_file:
+                raise Exception('The group \'%s\' does not exist'%group)
+            return dict(h5_file[group].attrs)
 
     def get_trace(self,name):
         with h5py.File(self.h5_path) as h5_file:
@@ -162,7 +190,29 @@ class Run(object):
                 raise Exception('The result array \'%s\' doesn not exist'%name)
             return array(h5_file['results'][group][name])
             
+    def get_result(self, group, name):
+        """Return 'result' in 'results/group' that was saved by 
+        the save_result() method."""
+        with h5py.File(self.h5_path) as h5_file:
+            if not group in h5_file['results']:
+                raise Exception('The result group \'%s\' does not exist'%group)
+            if not name in h5_file['results'][group].attrs.keys():
+                raise Exception('The result \'%s\' does not exist'%name)
+            return h5_file['results'][group].attrs.get(name)
+            
+    def get_results(self, group, *names):
+        """Iteratively call get_result(group,name) for each name provided.
+        Returns a list of all results in same order as names provided."""
+        results = []
+        for name in names:
+            results.append(self.get_result(group,name))
+        return results        
+            
     def save_result(self, name, value, group=None, overwrite=True):
+        """Save a result to h5 file. Defaults are to save to the active group 
+        in the 'results' group and overwrite an existing result.
+        Note that the result is saved as an attribute of 'results/group' and
+        overwriting attributes causes h5 file size bloat."""
         if self.no_write:
             raise Exception('This run is read-only. '
                             'You can\'t save results to runs through a '
@@ -186,7 +236,11 @@ class Run(object):
                 _updated_data[self.h5_path] = {}
             _updated_data[self.h5_path][str(self.group), name] = value
 
-    def save_result_array(self, name, data, group=None, overwrite=True, keep_attrs=False):
+    def save_result_array(self, name, data, group=None, 
+                          overwrite=True, keep_attrs=False, **kwargs):
+        """Save data array to h5 file. Defaults are to save to the active 
+        group in the 'results' group and overwrite existing data.
+        Additional keyword arguments are passed directly to h5py.create_dataset()."""
         if self.no_write:
             raise Exception('This run is read-only. '
                             'You can\'t save results to runs through a '
@@ -210,7 +264,7 @@ class Run(object):
                 else:
                     raise Exception('Dataset %s exists. Use overwrite=True to overwrite.' % 
                                      group + '/' + name)
-            h5_file[group].create_dataset(name, data=data)
+            h5_file[group].create_dataset(name, data=data, **kwargs)
             for key, val in attrs.items():
                 h5_file[group][name].attrs[key] = val
 
@@ -226,12 +280,16 @@ class Run(object):
             results.append(self.get_result_array(group, name))
         return results
         
-    def save_results(self, *args):
+    def save_results(self, *args, **kwargs):
+        """Iteratively call save_result() on multiple results.
+        Assumes arguments are ordered such that each result to be saved is
+        preceeded by the name of the attribute to save it under.
+        Keywords arguments are passed to each call of save_result()."""
         names = args[::2]
         values = args[1::2]
         for name, value in zip(names, values):
             print('saving %s =' % name, value)
-            self.save_result(name, value)
+            self.save_result(name, value, **kwargs)
             
     def save_results_dict(self, results_dict, uncertainties=False, **kwargs):
         for name, value in results_dict.items():
@@ -241,11 +299,15 @@ class Run(object):
                 self.save_result(name, value[0], **kwargs)
                 self.save_result('u_' + name, value[1], **kwargs)
 
-    def save_result_arrays(self, *args):
+    def save_result_arrays(self, *args, **kwargs):
+        """Iteratively call save_result_array() on multiple data sets. 
+        Assumes arguments are ordered such that each dataset to be saved is 
+        preceeded by the name to save it as. 
+        All keyword arguments are passed to each call of save_result_array()."""
         names = args[::2]
         values = args[1::2]
         for name, value in zip(names, values):
-            self.save_result_array(name, value)
+            self.save_result_array(name, value, **kwargs)
     
     def get_image(self,orientation,label,image):
         with h5py.File(self.h5_path) as h5_file:
@@ -432,7 +494,26 @@ def figure_to_clipboard(figure=None, **kwargs):
 
     figure.savefig(tempfile_name, **kwargs)
 
-    import lyse
-    lyse_dir = os.path.dirname(os.path.abspath(lyse.__file__))
-    tempfile2clipboard = os.path.join(lyse_dir, 'tempfile2clipboard.py')
+    tempfile2clipboard = os.path.join(LYSE_DIR, 'tempfile2clipboard.py')
     start_daemon([sys.executable, tempfile2clipboard, '--delete', tempfile_name])
+
+
+def register_plot_class(identifier, cls):
+    if not spinning_top:
+        msg = """Warning: lyse.register_plot_class has no effect on scripts not run with
+            the lyse GUI.
+            """
+        sys.stderr.write(dedent(msg))
+    _plot_classes[identifier] = cls
+
+def get_plot_class(identifier):
+    return _plot_classes.get(identifier, None)
+
+def delay_results_return():
+    global _delay_flag
+    if not spinning_top:
+        msg = """Warning: lyse.delay_results_return has no effect on scripts not run 
+            with the lyse GUI.
+            """
+        sys.stderr.write(dedent(msg))
+    _delay_flag = True
