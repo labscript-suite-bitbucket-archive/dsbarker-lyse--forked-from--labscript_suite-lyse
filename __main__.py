@@ -37,12 +37,13 @@ splash.update_text('importing pandas')
 import pandas
 
 splash.update_text('importing Qt')
-check_version('qtutils', '2.1.0', '3.0.0')
+check_version('qtutils', '2.2.2', '3.0.0')
 
 splash.update_text('importing labscript suite modules')
-check_version('labscript_utils', '2.11.0', '3')
+check_version('labscript_utils', '2.12.4', '3')
 
 from labscript_utils.ls_zprocess import ZMQServer, ProcessTree
+import zprocess
 from labscript_utils.labconfig import LabConfig, config_prefix
 from labscript_utils.setup_logging import setup_logging
 from labscript_utils.qtwidgets.headerview_with_widgets import HorizontalHeaderViewWithWidgets
@@ -217,12 +218,22 @@ class LyseMainWindow(QtWidgets.QMainWindow):
     def __init__(self, *args, **kwargs):
         QtWidgets.QMainWindow.__init__(self, *args, **kwargs)
         self._previously_painted = False
+        self.closing = False
 
     def closeEvent(self, event):
-        if app.on_close_event():
+        if self.closing:
             return QtWidgets.QMainWindow.closeEvent(self, event)
+        if app.on_close_event():
+            self.closing = True
+            timeout_time = time.time() + 2
+            self.delayedClose(timeout_time)
+        event.ignore()
+
+    def delayedClose(self, timeout_time):
+        if not all(app.workers_terminated().values()) and time.time() < timeout_time:
+            QtCore.QTimer.singleShot(50, lambda: self.delayedClose(timeout_time))
         else:
-            event.ignore()
+            self.close()
 
     def event(self, event):
         result = QtWidgets.QMainWindow.event(self, event)
@@ -273,7 +284,9 @@ class AnalysisRoutine(object):
         worker_path = os.path.join(LYSE_DIR, 'analysis_subprocess.py')
 
         child_handles = process_tree.subprocess(
-            worker_path, output_redirection_port=self.output_box_port
+            worker_path,
+            output_redirection_port=self.output_box_port,
+            startup_timeout=30,
         )
         
         to_worker, from_worker, worker = child_handles
@@ -348,7 +361,7 @@ class AnalysisRoutine(object):
         self.model.removeRow(index)
          
     def end_child(self, restart=False):
-        self.to_worker.put(['quit',None])
+        self.to_worker.put(['quit', None])
         timeout_time = time.time() + 2
         self.exiting = True
         QtCore.QTimer.singleShot(50,
@@ -1155,22 +1168,17 @@ class DataFrameModel(QtCore.QObject):
         self.row_number_by_filepath = {}
         self._previous_n_digits = 0
 
-        headerview_style = """
-                           QHeaderView {
-                             font-size: 8pt;
-                             color: black;
-                           }
-                           QHeaderView::section{
-                             font-size: 8pt;
-                             color: black;
-                           }
-                           """
-                           
         self._header = HorizontalHeaderViewWithWidgets(self._model)
         self._vertheader = QtWidgets.QHeaderView(QtCore.Qt.Vertical)
         self._vertheader.setSectionResizeMode(QtWidgets.QHeaderView.Fixed)
-        self._vertheader.setStyleSheet(headerview_style)
-        self._header.setStyleSheet(headerview_style)
+
+        # Smaller font for headers:
+        font = self._vertheader.font()
+        font.setPointSize(10 if sys.platform == 'darwin' else 8)
+        self._header.setFont(font)
+        font.setFamily('Ubuntu Mono')
+        self._vertheader.setFont(font)
+
         self._vertheader.setHighlightSections(True)
         self._vertheader.setSectionsClickable(True)
         self._view.setModel(self._model)
@@ -1408,9 +1416,6 @@ class DataFrameModel(QtCore.QObject):
             header_item = QtGui.QStandardItem(column_name_as_string)
             header_item.setToolTip(column_name_as_string)
             self._model.setHorizontalHeaderItem(column_number, header_item)
-        if new_column_names:
-            # Update the visibility state of new columns, in case some new columns are hidden:
-            self.set_columns_visible
 
         # Check and remove any no-longer-needed columns in the Qt model:
         defunct_column_names = (set(self.column_names.values()) - set(self.dataframe.columns)
@@ -1509,7 +1514,7 @@ class DataFrameModel(QtCore.QObject):
         for row_number in range(add_from, self._model.rowCount()):
             vertical_header_item = self._model.verticalHeaderItem(row_number)
             row_number_str = str(row_number).rjust(n_digits)
-            vert_header_text = '{}. |'.format(row_number_str)
+            vert_header_text = '{}. '.format(row_number_str)
             filepath_item = self._model.item(row_number, self.COL_FILEPATH)
             filepath = filepath_item.text()
             self.row_number_by_filepath[filepath] = row_number
@@ -1517,15 +1522,15 @@ class DataFrameModel(QtCore.QObject):
                 header_cols = ['sequence_index', 'run number', 'run repeat']
                 header_strings = []
                 for col in header_cols:
-                    try:
-                        val = self.dataframe[col].values[row_number]
-                        header_strings.append(' {:04d}'.format(val))
-                    except (KeyError, ValueError):
+                    val = self.dataframe[col].values[row_number]
+                    if pandas.notna(val):
+                        header_strings.append('{:04d}'.format(val))
+                    else:
                         header_strings.append('----')
-                vert_header_text += ' |'.join(header_strings)
+                vert_header_text += ' | '.join(header_strings)
             else:
                 basename = os.path.splitext(os.path.basename(filepath))[0]
-                vert_header_text += ' ' + basename
+                vert_header_text += basename
             vertical_header_item.setText(vert_header_text)
     
     @inmain_decorator()
@@ -1686,8 +1691,8 @@ class FileBox(object):
         self.analysis_pending.set()
         
     def on_run_multishot_analysis_clicked(self):
-         self.multishot_required = True
-         self.analysis_pending.set()
+        self.multishot_required = True
+        self.analysis_pending.set()
         
     def set_columns_visible(self, columns_visible):
         self.shots_model.set_columns_visible(columns_visible)
@@ -1966,21 +1971,38 @@ class Lyse(object):
         self.ui.show()
         # self.ui.showMaximized()
 
+    def terminate_all_workers(self):
+        for routine in self.singleshot_routinebox.routines + self.multishot_routinebox.routines:
+            routine.end_child()
+
+    def workers_terminated(self):
+        terminated = {}
+        for routine in self.singleshot_routinebox.routines + self.multishot_routinebox.routines:
+            routine.worker.poll()
+            terminated[routine.filepath] = routine.worker.returncode is not None
+        return terminated
+
+    def are_you_sure(self):
+        message = ('Current configuration (which scripts are loaded and other GUI state) '
+                   'has changed: save config file \'%s\'?' % self.last_save_config_file)
+        reply = QtWidgets.QMessageBox.question(self.ui, 'Quit lyse', message,
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No | QtWidgets.QMessageBox.Cancel)
+        if reply == QtWidgets.QMessageBox.Cancel:
+            return False
+        if reply == QtWidgets.QMessageBox.Yes:
+            self.save_configuration(self.last_save_config_file)
+        return True
+
     def on_close_event(self):
         save_data = self.get_save_data()
         if self.last_save_data is not None and save_data != self.last_save_data:
             if self.only_window_geometry_is_different(save_data, self.last_save_data):
                 self.save_configuration(self.last_save_config_file)
+                self.terminate_all_workers()
                 return True
-
-            message = ('Current configuration (which scripts are loaded and other GUI state) '
-                       'has changed: save config file \'%s\'?' % self.last_save_config_file)
-            reply = QtWidgets.QMessageBox.question(self.ui, 'Quit lyse', message,
-                                               QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No | QtWidgets.QMessageBox.Cancel)
-            if reply == QtWidgets.QMessageBox.Cancel:
+            elif not self.are_you_sure():
                 return False
-            if reply == QtWidgets.QMessageBox.Yes:
-                self.save_configuration(self.last_save_config_file)
+        self.terminate_all_workers()
         return True
 
     def on_save_configuration_triggered(self):
